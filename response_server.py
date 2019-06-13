@@ -14,7 +14,6 @@ from subprocess import check_output
 from ctypes import create_string_buffer
 
 MAX_UDP_PACKET_SIZE = 1472
-MAX_WORKERS = 70
 
 def get_host_ip():
     try:
@@ -33,7 +32,7 @@ class SimpleUDPServer:
     self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.server_socket.bind(address)
     self.descriptors = [self.server_socket,]
-    self.response_client_list = set()
+    self.response_client_list = []
   
   def server_address(self):
     return self.server_socket.getsockname()
@@ -43,10 +42,11 @@ class SimpleUDPServer:
       (sread, swrite, sexc) = select.select(self.descriptors, [], [])
       for client in sread:
         try:
-          data = client.recv(MAX_UDP_PACKET_SIZE)
+          data, sender = client.recvfrom(MAX_UDP_PACKET_SIZE)
+          logging.debug("Receive from %s:%d"%sender)
           if len(data):
             # push into client_buffer
-            self.request_handler(client, data)
+            self.request_handler(sender, data)
         except OSError as err:
           logging.error(err)
           self.descriptors.remove(client)
@@ -57,57 +57,51 @@ class SimpleUDPServer:
     if not request:
       return
 
-    logging.debug(request)
     if request['type'] == CommandHandler.ClientActive:
-      if client not in self.descriptors:
-        self.descriptors.add(client)
-        logging.info("%s:%s connect." % client.getpeername())
-    else if request['type'] == CommandHandler.ClientResponse:
+      if client not in self.response_client_list:
+        logging.info("%s:%s connect." % client)
+        self.response_client_list.append(client)
+        response = self.command_handler.build_server_response()
+        self.server_socket.sendto(response, client)
+
+    elif request['type'] == CommandHandler.ClientResponse:
       response = self.command_handler.build_server_response()
-      client.sendall(response)
-    else
+      if client in self.response_client_list:
+        self.server_socket.sendto(response, client)
+
+    else:
       logging.error("Unknow type %d for udp server!!"%request['type'])
   
   def exec_request(self, client):
     request = self.command_handler.build_exec_request()
     while True:
-      client.sendall(request)
+      self.server_socket.sendto(request, client)
       try:
-        self.socket.settimeout(2.0)
-        response = self.socket.recv(MAX_UDP_PACKET_SIZE)
+        self.server_socket.settimeout(2.0)
+        response = self.server_socket.recv(MAX_UDP_PACKET_SIZE)
         response = self.command_handler.parse_client_request(response)
-        if response['type'] == CommandHandler.ClientResponse
-          logging.info("Get connection response from server")
+        if response['type'] == CommandHandler.ClientResponse:
+          logging.info("Get exec response from server")
           response = self.command_handler.build_server_response()
-          client.sendall(response)
+          self.server_socket.sendto(response, client)
           break;
       except socket.timeout:
         logging.info("Get server response timeout!")
     return client
 
-  def broadcast(self, data, ignore_clients=[]):
-    try:
-      for client in self.descriptors:
-        if client != self.server_socket and (client not in ignore_clients):
-          client.sendall(data)
-    except OSError as err:
-      logging.error(err)
-
   def start_request(self):
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    all_task = []
-    for client in self.descriptors:
-      all_task.append(executor.submit(exec_request, client))
-    logging.debug(len(all_task))
-    for future in as_completed(all_task):
-      client = future.result()
+#    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+#    all_task = []
+    for client in self.response_client_list:
+      self.exec_request(client)
+#      logging.debug("%s:%d Exec request"%client)
+#      all_task.append(executor.submit(exec_request, client))
+#    logging.debug(len(all_task))
+#    for future in as_completed(all_task):
+#      client = future.result()
+    logging.info("Notify all finished!")
 
-    self.transfer_end_time = time.time()
-    logging.info("Notify all finished, spend %f!"%(self.transfer_end_time-self.transfer_start_time))
-    self.response_client_list = []
-    self.total_time = 0.0
-
-clas SimpleUDPClien :
+class SimpleUDPClient:
   def __init__(self, command_handler):
     self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.command_handler = command_handler
@@ -115,15 +109,16 @@ clas SimpleUDPClien :
   def __del__(self):
     self.socket.close()
 
-  def connect(self, server_address, server_port):
+  def connect(self, server_address, server_port, client_port):
     self.server_address = server_address
     self.server_port = server_port
     try:
+      self.socket.bind((get_host_ip(), client_port))
       self.socket.connect((self.server_address, self.server_port))
     except OSError as msg:
       logging.error("connect failed, error: %s" % msg)
       return False
-    self.send_connect_request():
+    self.send_connect_request()
     return True
 
   def send_connect_request(self):
@@ -134,7 +129,8 @@ clas SimpleUDPClien :
       try:
         response = self.socket.recv(MAX_UDP_PACKET_SIZE)
         response = self.command_handler.parse_server_request(response)
-        if response['type'] == CommandHandler.ServerResponse
+        logging.debug("Response %s"%response)
+        if response['type'] == CommandHandler.ServerResponse:
           logging.info("Get connection response from server")
           break;
         client_response = self.command_handler.build_client_response()
@@ -143,6 +139,7 @@ clas SimpleUDPClien :
         logging.info("Get server response timeout!")
 
   def wait_transfer_start(self):
+    self.socket.settimeout(None)
     while True:
       data = self.socket.recv(MAX_UDP_PACKET_SIZE)
       if len(data):
@@ -150,7 +147,7 @@ clas SimpleUDPClien :
         if result["type"] == CommandHandler.Exec:
           self.exec_response()
           break;
-        elif if result["type"] == CommandHandler.ServerResponse:
+        elif result["type"] == CommandHandler.ServerResponse:
           logging.error("Get server response!")
           client_response = self.command_handler.build_client_response()
           self.socket.sendall(client_response)
@@ -161,14 +158,16 @@ clas SimpleUDPClien :
   def exec_response(self):
     client_response = self.command_handler.build_client_response()
     while True:
-      self.socket.sendall(request)
+      self.socket.sendall(client_response)
       self.socket.settimeout(2.0)
       try:
         response = self.socket.recv(MAX_UDP_PACKET_SIZE)
         response = self.command_handler.parse_server_request(response)
-        if response['type'] == CommandHandler.ServerResponse
+        if response['type'] == CommandHandler.ServerResponse:
           logging.info("Get Exec response from server")
           break;
+        elif response['type'] == CommandHandler.Exec:
+            self.exec_response()
       except socket.timeout:
         logging.info("Get server response timeout!")
 
@@ -191,24 +190,24 @@ class CommandHandler(object):
     return CommandHandler._instance
 
   def parse_server_request(self, data):
-    resp = json.load(data) 
+    resp = json.loads(data.decode('utf-8')) 
     logging.debug(resp)
     return resp
 
   def parse_client_request(self, data):
-    resp = json.load(data) 
+    resp = json.loads(data.decode('utf-8')) 
     logging.debug(resp)
     return resp
 
-  def build_connection_request(self)
+  def build_connection_request(self):
     req = {"type": CommandHandler.ClientActive}
     return bytes(json.dumps(req).encode('utf-8'))
 
-  def build_server_response(self)
+  def build_server_response(self):
     req = {"type": CommandHandler.ServerResponse}
     return bytes(json.dumps(req).encode('utf-8'))
 
-  def build_client_response(self)
+  def build_client_response(self):
     req = {"type": CommandHandler.ClientResponse}
     return bytes(json.dumps(req).encode('utf-8'))
 
@@ -216,70 +215,7 @@ class CommandHandler(object):
     req = {"type": CommandHandler.Exec}
     return bytes(json.dumps(req).encode('utf-8'))
 
-  
-class MulticastBroker:
-  def __init__(self, multicast_address):
-    self.multicast_host, self.multicast_port = multicast_address
-    self.multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    self.data_handler = self.default_data_handler
-    self.interfaces = [get_host_ip(),]
-#    self.interfaces = check_output(['hostname','--all-ip-addresses'])[:-1]
-#    self.interfaces = str(self.interfaces, encoding="utf-8").split(' ')[:-1]
-    self.interfaces.append('0.0.0.0')
-    self.stop = False
-    logging.debug(self.interfaces)
-
-  def default_data_handler(self, data):
-    pass
-  
-  def set_data_handler(self, handler):
-    self.data_handler = handler
-
-  def stop_receive(self):
-    self.stop = True
-
-  def receive_loop(self):
-    self.stop = False
-    receive_sockets = []
-    for interface in self.interfaces:
-      sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      sock.bind((interface, self.multicast_port))
-      mreq = struct.pack('4s4s', socket.inet_aton(self.multicast_host), socket.inet_aton(interface))
-      sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-      receive_sockets.append(sock) 
-
-    loop = True
-    while loop and not self.stop:
-      (sread, swrite, sexc) = select.select(receive_sockets, [], [])
-      for sock in sread:
-        try:
-          data = sock.recv(MAX_UDP_PACKET_SIZE)
-#          logging.debug("Multicast recv %d bytes", len(data))
-          if len(data):
-            if(self.data_handler(data) == False):
-              logging.debug("Exit recve_loop")
-              loop = False
-              break;
-        except OSError as err:
-          logging.error(err)
-          loop = False
-
-    for sock in receive_sockets:
-      sock.close()
-
-  
-  def send(self, data):
-    # for test, random throw packet
-    #if random.randint(0,99) < 20:
-    #  return
-
-    if len(data) > MAX_UDP_PACKET_SIZE:
-      logging.warning("Data send by multicast should less than %d, now is %d" %(MAX_UDP_PACKET_SIZE, len(data)))
-#    logging.debug("Multicast send %d bytes", len(data))
-    self.multicast_socket.sendto(data, (self.multicast_host, self.multicast_port))
-
-def input_handler(input, server, transfer):
+def input_handler(input, server):
   command = input
   if command == "start":
     server.start_request()
@@ -300,11 +236,18 @@ def main(args):
   server_ip, server_port = args.address.split(':')
 
   if args.client:
+    if not args.port:
+      logging.critical("Need server address as input, like \"127.0.0.1:60001\"")
+      arg_parser.print_help()
+      exit()
+
     command_client = SimpleUDPClient(CommandHandler())
-    if command_client.connect(server_ip, int(server_port)):
+    if command_client.connect(server_ip, int(server_port), args.port):
       while True:
         file_info = command_client.wait_transfer_start()
         logging.debug("Get start signal")
+        cmd = "iperf -c 172.18.146.19 -b 5m -t 1 -i 1 -p 6666"
+        os.system(cmd)
       
   elif args.server:
     server = SimpleUDPServer((server_ip, int(server_port)), CommandHandler())
@@ -316,7 +259,7 @@ def main(args):
     logging.info("Server %s:%d loop running in thread: %s"%(server_ip, server_port, server_thread.name))
 
     for line in sys.stdin:
-      is_exit = input_handler(line.strip('\n'), server, transfer)
+      is_exit = input_handler(line.strip('\n'), server)
       if is_exit:
         break;
 
@@ -333,6 +276,8 @@ if __name__ == "__main__":
                           action="store_true")
   arg_parser.add_argument('-a', "--address", help="server address", 
                           type=str)
+  arg_parser.add_argument('-p', "--port", help="client port", 
+                          type=int)
   args = arg_parser.parse_args()
 
   if not args.client and not args.server:
